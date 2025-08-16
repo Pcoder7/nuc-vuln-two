@@ -1,1 +1,370 @@
+name: Distributed Nuclei Scan Two
 
+
+on:
+  workflow_run:
+    workflows: ["Distributed httprobe Two"]
+    types:
+      - completed
+      
+  workflow_dispatch:
+
+permissions:
+  contents: write   # For creating artifacts and potentially committing aggregated results
+  actions: write    # For triggering workflows in the secondary repository
+
+env:
+  TARGETS_PER_CHUNK: 15
+  PRIMARY_ACCOUNT_MAX_PARALLEL: 20 # Max parallel jobs for THIS account's scan job
+  # Define the secondary account repo details for offloading work
+  ACCOUNT2_REPO_OWNER: ${{ secrets.ACCOUNT2_REPO_OWNER  }}
+  ACCOUNT2_REPO_NAME: ${{ secrets.ACCOUNT2_REPO_NAME }}
+
+jobs:
+  prepare_scan_chunks_and_package:
+    name: Prepare Target Chunks & Package
+    runs-on: ubuntu-latest
+    outputs:
+      # The full JSON matrix string of ALL generated target chunks
+      all_chunks_matrix_json: ${{ steps.build_full_matrix.outputs.full_matrix }}
+      # The total number of chunks generated
+      total_chunks_count: ${{ steps.build_full_matrix.outputs.total_chunks }}
+      # The name of the artifact containing all chunks
+      chunk_package_artifact_name: "scan-chunks-package-${{ github.run_id }}"
+    env:
+      STORE_OWNER: ${{ secrets.SECONDRY_USERNAME }}
+      STORE_REPO_NAME: ${{ secrets.STORE }}
+      STORE_TOKEN: ${{ secrets.PAT_FOR_SECONDRY }}
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ env.STORE_OWNER }}/${{ env.STORE_REPO_NAME }}
+          token: ${{ env.STORE_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure Git for Scripting
+        run: git config --global color.ui never        
+
+      - name: Verify Essential Tools (jq, split)
+        shell: bash
+        run: |
+          echo "Verifying essential tools are present..."
+          command -v jq >/dev/null 2>&1 || { echo "jq is not installed. Aborting."; exit 0; }
+
+          echo "All essential tools found."
+
+      - name: Extract Latest Entries
+        id: extract_entries
+        shell: bash
+        run: |
+
+          PATTERN="Update httpx results from workflow run"
+          # The path pattern to find the target files using a wildcard (*)
+          TARGET_PATHSPEC="results/*/httpx_result.txt"
+
+          # --- Block 1: Finding the Commit (Unchanged) ---
+          printf "::group::[DEBUG] Block 1: Finding Commit\n"
+          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
+            COMMIT="${{ github.event.workflow_run.head_sha }}"
+          else
+            COMMIT=$(git log --no-merges --grep="$PATTERN" -n1 --format="%H")
+          fi
+          if [ -z "$COMMIT" ]; then
+            printf "::error::No commit found matching '$PATTERN'\n"
+            exit 1
+          fi
+          echo "   → Found commit: $COMMIT"
+          printf "::endgroup::\n"
+
+          # --- Block 2: Generating a Targeted Raw Diff using a Pathspec (Modified) ---
+          printf "::group::[DEBUG] Block 2: Generating Raw Diff for paths matching '$TARGET_PATHSPEC'\n"
+          # We provide the wildcard pathspec to git. It will find ALL files matching
+          # this pattern that were changed in the commit and create a combined diff.
+          if git rev-parse --verify $COMMIT^ >/dev/null 2>&1; then
+            git diff "$COMMIT^" "$COMMIT" --unified=0 -- "$TARGET_PATHSPEC" > raw_diff.log || true
+          else
+            git show "$COMMIT" --unified=0 -- "$TARGET_PATHSPEC" > raw_diff.log || true
+          fi
+          printf "::endgroup::\n"
+          
+          # --- Block 3: Filtering Diff (Unchanged) ---
+          # This filtering logic does not need to change. It will correctly process
+          # the combined diff from all the matched files.
+          printf "::group::[DEBUG] Block 3: Filtering Diff\n"
+          grep '^\+' raw_diff.log --color=never | grep -vE '^\+\+\+' --color=never | awk -F' ' '{print $1}' > latest_entries.txt || true
+
+          cat latest_entries.txt |  awk '{for(i=1;i<=NF;i++){gsub(/^\+/, "", $i); print $i}}' | grep -vE '.af.mil' --color=never > entries.txt || true
+
+          head -n500 entries.txt > for_nuclei.txt
+          head -n5 for_nuclei.txt
+          printf "::endgroup::\n"
+
+          printf "::group::[DEBUG] Block 4: Final Validation\n"
+          COUNT=$(wc -l < latest_entries.txt)
+          if [ "$COUNT" -eq 0 ]; then
+            # The error message now correctly references the pattern, not a single file.
+            printf "::error::No added content lines were found in files matching '%s' from commit %s.\n" "$TARGET_PATHSPEC" "$COMMIT"
+            exit 1
+          fi
+          echo "✅ Successfully extracted $COUNT new entries from files matching '$TARGET_PATHSPEC' into latest_entries.txt"
+          printf "::endgroup::\n"
+
+
+         
+          echo "✅ Found $COUNT new entries in $COMMIT" 
+            
+
+
+      - name: Build Full Matrix & Create Target Chunks
+        id: build_full_matrix
+        shell: bash
+        run: |
+          # --- Initialization ---
+          JSON_MATRIX='[]'
+          # Define constants for clarity and easy maintenance.
+          # INPUT_FILE is the single source of truth from the previous step.
+          INPUT_FILE="for_nuclei.txt"
+          # DOMAIN_NAME is the static name for the subdirectory inside chunks/.
+          DOMAIN_NAME="latestscan"
+
+          echo "INFO: Processing a single input file: '$INPUT_FILE'"
+          
+          # --- Main Processing Logic ---
+          # Instead of searching and looping, we now check for one specific file.
+          # The '-s' flag checks if the file exists AND is not empty.
+          if [ ! -s "$INPUT_FILE" ]; then
+            echo "WARNING: Input file '$INPUT_FILE' not found or is empty. No chunks will be created."
+          else
+            echo "INFO: Found `wc -l < $INPUT_FILE` targets in '$INPUT_FILE'."
+            
+            # 1. Create the single, statically-named output directory.
+            mkdir -p "chunks/$DOMAIN_NAME"
+            
+            # 2. Split the single input file into chunks within that directory.
+            split -l "${TARGETS_PER_CHUNK:-100}" -a 3 --numeric-suffixes=1 "$INPUT_FILE" "chunks/$DOMAIN_NAME/chunk_"
+            
+            # 3. Find all chunks that were just created and build the JSON matrix.
+            # This loop is still needed, but it's now outside the old 'for' loop.
+            while IFS= read -r chunk_file_path; do
+              # Skip any empty lines that 'find' might produce.
+              [ -z "$chunk_file_path" ] && continue
+              JSON_MATRIX=$(printf '%s' "$JSON_MATRIX" | jq -c --arg d "$DOMAIN_NAME" --arg c "$chunk_file_path" '. + [{domain:$d,chunk:$c}]')
+            done < <(find "chunks/$DOMAIN_NAME/" -name 'chunk_*' -type f -print)
+          fi
+
+          # --- Final Output Generation (This logic is unchanged) ---
+          TOTAL_CHUNKS=$(echo "$JSON_MATRIX" | jq 'length')
+          echo "FINAL_BUILD_INFO: Total target chunks in matrix: $TOTAL_CHUNKS"
+          echo "full_matrix=$JSON_MATRIX" >> $GITHUB_OUTPUT
+          echo "total_chunks=$TOTAL_CHUNKS" >> $GITHUB_OUTPUT
+
+      - name: Package All Target Chunks
+        id: package_chunks
+        if: steps.build_full_matrix.outputs.total_chunks > 0
+        shell: bash
+        run: |
+          # This step works perfectly with the modified step above because the 
+          # output directory structure 'chunks/' is preserved.
+          BASE_ARTIFACT_NAME="scan-chunks-package-${{ github.run_id }}"
+          PACKAGE_TAR_FILENAME="${BASE_ARTIFACT_NAME}.tar.gz"
+          echo "INFO: Creating tarball: $PACKAGE_TAR_FILENAME"
+          tar -czvf "$PACKAGE_TAR_FILENAME" chunks
+          echo "package_tar_filename=$PACKAGE_TAR_FILENAME" >> $GITHUB_OUTPUT
+          echo "base_artifact_name=$BASE_ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          
+      - name: Upload Full Chunks Package
+        if: steps.build_full_matrix.outputs.total_chunks > 0
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package_chunks.outputs.base_artifact_name }}
+          path: ${{ steps.package_chunks.outputs.package_tar_filename }}
+          retention-days: 1
+
+  distribute_and_trigger_secondary:
+    name: Distribute Work & Trigger Secondary Scan
+    needs: prepare_scan_chunks_and_package
+    if: needs.prepare_scan_chunks_and_package.outputs.total_chunks_count > 0
+    runs-on: ubuntu-latest
+    outputs:
+      primary_matrix_json: ${{ steps.calculate_distribution.outputs.primary_matrix }}
+    steps:
+      - name: Calculate Chunk Distribution
+        id: calculate_distribution
+        shell: bash
+        run: |
+          ALL_CHUNKS_JSON='${{ needs.prepare_scan_chunks_and_package.outputs.all_chunks_matrix_json }}'
+          PRIMARY_MAX_PARALLEL=${{ env.PRIMARY_ACCOUNT_MAX_PARALLEL }}
+          CHUNKS_FOR_PRIMARY=$(echo "$ALL_CHUNKS_JSON" | jq -c ".[0:$PRIMARY_MAX_PARALLEL]")
+          CHUNKS_FOR_SECONDARY=$(echo "$ALL_CHUNKS_JSON" | jq -c ".[$PRIMARY_MAX_PARALLEL:]")
+          echo "primary_matrix=$CHUNKS_FOR_PRIMARY" >> $GITHUB_OUTPUT
+          echo "secondary_matrix=$CHUNKS_FOR_SECONDARY" >> $GITHUB_OUTPUT
+          echo "secondary_chunks_exist=$(if [ $(echo "$CHUNKS_FOR_SECONDARY" | jq 'length') -gt 0 ]; then echo true; else echo false; fi)" >> $GITHUB_OUTPUT
+      
+      - name: Prepare Trigger Payload for Secondary Scan
+        id: prepare_payload
+        if: steps.calculate_distribution.outputs.secondary_chunks_exist == 'true'
+        shell: bash
+        run: |
+          SECONDARY_MATRIX_AS_STRING='${{ steps.calculate_distribution.outputs.secondary_matrix }}'
+          JSON_PAYLOAD=$(jq -cn \
+            --arg server_url "${{ github.server_url }}" \
+            --arg repo_owner "${{ github.repository_owner }}" \
+            --arg repo_name "${{ github.event.repository.name }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg artifact_name "${{ needs.prepare_scan_chunks_and_package.outputs.chunk_package_artifact_name }}" \
+            --arg matrix_as_a_string "${SECONDARY_MATRIX_AS_STRING}" \
+            '{
+              "primary_github_server_url": $server_url,
+              "primary_repo_owner": $repo_owner,
+              "primary_repo_name": $repo_name,
+              "primary_run_id": $run_id,
+              "chunk_package_artifact_name": $artifact_name,
+              "secondary_matrix_json": $matrix_as_a_string 
+            }')
+          echo "json_string=$JSON_PAYLOAD" >> $GITHUB_OUTPUT
+      
+      - name: Trigger Secondary Account Scan Workflow
+        if: steps.calculate_distribution.outputs.secondary_chunks_exist == 'true'
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: nuc_receive.yml # **IMPORTANT: The receiving workflow must be named this**
+          repo: ${{ env.ACCOUNT2_REPO_OWNER }}/${{ env.ACCOUNT2_REPO_NAME }}
+          token: ${{ secrets.PAT_FOR_SECONDARY_ACCOUNT_REPO }}
+          inputs: ${{ steps.prepare_payload.outputs.json_string }}
+          ref: main
+
+  run_nuclei_on_primary_chunks:
+    name: Run Nuclei Scan on Primary Chunks
+    needs: [prepare_scan_chunks_and_package, distribute_and_trigger_secondary]
+    if: needs.prepare_scan_chunks_and_package.outputs.total_chunks_count > 0 && needs.distribute_and_trigger_secondary.outputs.primary_matrix_json != '[]'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/pcoder7/spider-puredns-actions:latest
+      credentials:
+        username: ${{ secrets.GHCR_USER }}
+        password: ${{ secrets.GHCR_TOKEN }}    
+    strategy:
+      fail-fast: false
+      max-parallel: 20 
+      matrix:
+        pair: ${{ fromJson(needs.distribute_and_trigger_secondary.outputs.primary_matrix_json) }}
+    steps:
+
+      - name: Checkout repository (for results structure)
+        uses: actions/checkout@v3
+          
+      - name: Download Full Chunks Package for Primary
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-chunks-package-${{ github.run_id }}
+          # Downloads to current directory
+
+      - name: Extract Chunks for Primary
+        shell: bash
+        run: |
+          PACKAGE_FILENAME="scan-chunks-package-${{ github.run_id }}.tar.gz"
+          echo "Extracting $PACKAGE_FILENAME..."
+          tar -xzvf "$PACKAGE_FILENAME"
+          if [ ! -d "chunks" ]; then
+             echo "ERROR: 'chunks/' not found after extraction!"
+             exit 1
+          fi
+          echo "Extraction complete. 'chunks/' should be present."
+          ls -R chunks/
+
+      - name: Run Nuclei Scan
+        shell: bash
+        run: |
+          DOMAIN=${{ matrix.pair.domain }}
+          CHUNK_FILE_PATH=${{ matrix.pair.chunk }}
+
+          echo "Processing domain '$DOMAIN' with chunk '$CHUNK_FILE_PATH'..."
+          if [ ! -f "$CHUNK_FILE_PATH" ]; then
+            echo "ERROR: Chunk file '$CHUNK_FILE_PATH' not found!"
+            exit 1
+          fi
+
+
+          # Update Nuclei templates to the latest version (good practice)
+          echo "-> Updating Nuclei templates..."
+          nuclei -ut -silent
+
+          OUTPUT_FILE="nuclei_output.txt"
+          # Run the Nuclei scan on the assigned chunk
+          echo "-> Running Nuclei on '$CHUNK_FILE_PATH'..."
+          nuclei \
+            -l "$CHUNK_FILE_PATH" \
+            -t ~/nuclei-templates/http/technologies \
+            -ss template-spray \
+            -c 50 \
+            -bs 100 \
+            -rl 150 \
+            -no-httpx \
+            -nc \
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36' \
+            -o "$OUTPUT_FILE" \
+            -silent > /dev/null 2>&1
+
+          if [ ! -s "$OUTPUT_FILE" ]; then
+            echo "-> No findings from Nuclei for this chunk."
+            # We still create an empty file so the artifact upload doesn't fail
+            touch "$OUTPUT_FILE"
+          else
+            echo "-> Nuclei scan complete. Results are in '$OUTPUT_FILE'."
+          fi
+      
+      - name: Install notify
+        env: 
+          DISCORD_WEBHOOK: ${{ secrets.DIS_WEBHOOK }}
+        run: |
+          go install -v github.com/projectdiscovery/notify/cmd/notify@latest
+          mkdir -p ~/.config/notify/
+          cat <<EOF > ~/.config/notify/provider-config.yaml
+              # Write provider config with our Discord webhook
+          discord:
+            - id: "subscan"
+              discord_channel: "subdomain-scan"
+              discord_format: "{{data}}"
+              discord_webhook_url: "${{ secrets.DIS_WEBHOOK }}"
+          EOF
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          # display and show provider-config.yaml file
+          cat ~/.config/notify/provider-config.yaml  
+     
+      - name: Show notify config
+        run: | 
+          echo "$DIS_WEBHOOK"
+          sed -e 's/.*/&/' ~/.config/notify/provider-config.yaml
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DIS_WEBHOOK }}         
+
+      - name: Notify Discord for Nuc scab
+        run: |
+          # 1. Capture today’s date and the current domain
+          DATE=$(date +"%d-%m-%Y")
+          DOMAIN="${{ matrix.pair.domain }}"
+      
+          # 2. Path to the file with only the new subdomains
+          FILE="nuclei_output.txt"
+      
+          # 3. Count how many new subdomains we have
+          COUNT=$(wc -l < "$FILE")
+      
+          # 4. If more than 50, send a header message, then the file
+          if [ "$COUNT" -gt 3 ]; then
+            # 4a. Send a text header with domain and date
+            echo -e "🔔 $COUNT New Entry  \n📅 Date: ${DATE}" \
+              | notify -id subscan
+            # 4b. Send the full list as a file
+            notify -bulk -id subscan -data "$FILE"
+          else
+            # 5. If 1–50 new entries, send one bulk message including header and list
+            {
+              echo "🔔 $COUNT New Entry"
+              echo "📅 Date: ${DATE}"
+              
+              cat "$FILE"
+            } | notify -bulk -id subscan
+          fi

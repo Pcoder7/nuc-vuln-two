@@ -1,8 +1,7 @@
 name: Distributed Nuclei Scan Two
 
-
 on:
-      
+     
   workflow_dispatch: {}
 
 permissions:
@@ -56,25 +55,29 @@ jobs:
 
           echo "All essential tools found."
 
+
       - name: Extract Latest Entries
         id: extract_entries
         shell: bash
         run: |
 
-          PATTERN="Update httpx results from workflow run"
+          PATTERN="Automated http-multiple results from Correlation ID:"
+          
           # The path pattern to find the target files using a wildcard (*)
+          
           TARGET_PATHSPEC="results/*/httpx_result.txt"
 
           # --- Block 1: Finding the Commit (Unchanged) ---
           printf "::group::[DEBUG] Block 1: Finding Commit\n"
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            COMMIT="${{ github.event.workflow_run.head_sha }}"
-          else
-            COMMIT=$(git log --no-merges --grep="$PATTERN" -n1 --format="%H")
-          fi
+          
+          # MODIFIED: The logic now ALWAYS searches the git log for the most recent
+          # commit with the pattern. This is simpler and correctly finds the result
+          # commit, implementing the "fallback" you want.
+          COMMIT=$(git log --no-merges --grep="$PATTERN" -n1 --format="%H")
+
           if [ -z "$COMMIT" ]; then
             printf "::error::No commit found matching '$PATTERN'\n"
-            exit 0
+            
           fi
           echo "   → Found commit: $COMMIT"
           printf "::endgroup::\n"
@@ -107,17 +110,14 @@ jobs:
           if [ "$COUNT" -eq 0 ]; then
             # The error message now correctly references the pattern, not a single file.
             printf "::error::No added content lines were found in files matching '%s' from commit %s.\n" "$TARGET_PATHSPEC" "$COMMIT"
-            exit 0
+            
           fi
           echo "✅ Successfully extracted $COUNT new entries from files matching '$TARGET_PATHSPEC' into latest_entries.txt"
           printf "::endgroup::\n"
-
-
          
-          echo "✅ Found $COUNT new entries in $COMMIT" 
-            
-
-
+          echo "✅ Found $COUNT new entries in $COMMIT"
+          
+          
       - name: Build Full Matrix & Create Target Chunks
         id: build_full_matrix
         shell: bash

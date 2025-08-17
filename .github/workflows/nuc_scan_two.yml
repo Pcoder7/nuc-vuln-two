@@ -2,12 +2,8 @@ name: Distributed Nuclei Scan Two
 
 
 on:
-  workflow_run:
-    workflows: ["Distributed httprobe Two"]
-    types:
-      - completed
       
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: write   # For creating artifacts and potentially committing aggregated results
@@ -35,8 +31,13 @@ jobs:
       STORE_OWNER: ${{ secrets.SECONDRY_USERNAME }}
       STORE_REPO_NAME: ${{ secrets.STORE }}
       STORE_TOKEN: ${{ secrets.PAT_FOR_SECONDRY }}
-      
+    if: ${{ github.actor == 'Pcoder7' }}  
     steps:
+      - name: Log trigger info
+        run: |
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Run id: ${{ github.run_id }}"
+          
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
@@ -368,3 +369,19 @@ jobs:
               cat "$FILE"
             } | notify -bulk -id subscan
           fi
+
+  trigger_recursive_subdomain:
+    name: Trigger recursive subdomain
+    needs: [run_nuclei_on_primary_chunks]
+    
+    if: success() 
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger next workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: recursive_assetfinder.yml
+          repo: Pcoder7/Recursive-subdomain
+          token: ${{ secrets.PAT_TOKEN }}
+          ref: main
+          

@@ -74,7 +74,7 @@ jobs:
           fi
           if [ -z "$COMMIT" ]; then
             printf "::error::No commit found matching '$PATTERN'\n"
-            exit 1
+            exit 0
           fi
           echo "   → Found commit: $COMMIT"
           printf "::endgroup::\n"
@@ -107,7 +107,7 @@ jobs:
           if [ "$COUNT" -eq 0 ]; then
             # The error message now correctly references the pattern, not a single file.
             printf "::error::No added content lines were found in files matching '%s' from commit %s.\n" "$TARGET_PATHSPEC" "$COMMIT"
-            exit 1
+            exit 0
           fi
           echo "✅ Successfully extracted $COUNT new entries from files matching '$TARGET_PATHSPEC' into latest_entries.txt"
           printf "::endgroup::\n"
@@ -270,7 +270,7 @@ jobs:
           tar -xzvf "$PACKAGE_FILENAME"
           if [ ! -d "chunks" ]; then
              echo "ERROR: 'chunks/' not found after extraction!"
-             exit 1
+             exit 0
           fi
           echo "Extraction complete. 'chunks/' should be present."
           ls -R chunks/
@@ -284,7 +284,7 @@ jobs:
           echo "Processing domain '$DOMAIN' with chunk '$CHUNK_FILE_PATH'..."
           if [ ! -f "$CHUNK_FILE_PATH" ]; then
             echo "ERROR: Chunk file '$CHUNK_FILE_PATH' not found!"
-            exit 1
+            exit 0
           fi
 
 

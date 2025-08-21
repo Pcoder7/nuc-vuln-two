@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: |
 
-          PATTERN="Automated http-multiple results from Correlation ID:"
+          PATTERN="feat(http-multiple-two):"
           
           # The path pattern to find the target files using a wildcard (*)
           

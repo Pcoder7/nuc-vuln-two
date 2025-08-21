@@ -73,7 +73,7 @@ jobs:
           # MODIFIED: The logic now ALWAYS searches the git log for the most recent
           # commit with the pattern. This is simpler and correctly finds the result
           # commit, implementing the "fallback" you want.
-          COMMIT=$(git log --no-merges --grep="$PATTERN" -n1 --format="%H")
+          COMMIT=$(git log --no-merges --grep="$PATTERN" -n1 --format="%H" || true)
 
           if [ -z "$COMMIT" ]; then
             printf "::error::No commit found matching '$PATTERN'\n"
